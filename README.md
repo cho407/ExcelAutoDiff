@@ -89,6 +89,13 @@ GUI 흐름:
 - `dist/ExcelAutoDiff-v1.0.0-macOS.zip`
 - `dist/ExcelAutoDiff-v1.0.0-macOS.dmg`
 
+선택 사항(서명/노타라이즈):
+- 환경 변수로 아래 값을 주면 빌드 스크립트가 서명/노타라이즈를 수행합니다.
+  - `APPLE_SIGN_IDENTITY`
+  - `APPLE_NOTARY_KEY_ID`
+  - `APPLE_NOTARY_ISSUER_ID`
+  - `APPLE_NOTARY_KEY_P8`
+
 ### GitHub Releases 배포
 
 이미 포함된 워크플로우:
@@ -100,8 +107,13 @@ GUI 흐름:
 3. Release Assets에 `.dmg`, `.zip` 자동 업로드
 
 주의:
-- 현재 워크플로우는 서명/노타라이즈는 포함하지 않습니다.
-- 외부 배포(일반 사용자 대상) 시 Apple Developer 서명/노타라이즈 추가를 권장합니다.
+- `v*` 태그 릴리즈는 GitHub Actions에서 서명 + 노타라이즈를 수행하도록 구성되어 있습니다.
+- 아래 GitHub Secrets가 없으면 태그 릴리즈 작업은 실패하도록 설정되어 있습니다.
+  - `APPLE_SIGN_IDENTITY` (예: `Developer ID Application: <Name> (<TEAMID>)`)
+  - `APPLE_NOTARY_KEY_ID`
+  - `APPLE_NOTARY_ISSUER_ID`
+  - `APPLE_NOTARY_KEY_P8` (App Store Connect API key `.p8` 전체 내용)
+- 외부 배포(일반 사용자 대상) 시 Apple Developer 서명/노타라이즈를 반드시 유지하세요.
 
 ## 보안/운영 주의사항
 

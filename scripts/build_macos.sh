@@ -15,6 +15,22 @@ APP_NAME="ExcelAutoDiff"
 APP_PATH="dist/${APP_NAME}.app"
 ZIP_PATH="dist/${APP_NAME}-${SAFE_VERSION}-macOS.zip"
 DMG_PATH="dist/${APP_NAME}-${SAFE_VERSION}-macOS.dmg"
+SIGN_IDENTITY="${APPLE_SIGN_IDENTITY:-}"
+NOTARY_KEY_ID="${APPLE_NOTARY_KEY_ID:-}"
+NOTARY_ISSUER_ID="${APPLE_NOTARY_ISSUER_ID:-}"
+NOTARY_KEY_P8="${APPLE_NOTARY_KEY_P8:-}"
+NOTARY_TMP_ZIP=""
+NOTARY_KEY_FILE=""
+
+cleanup() {
+  if [[ -n "$NOTARY_TMP_ZIP" && -f "$NOTARY_TMP_ZIP" ]]; then
+    rm -f "$NOTARY_TMP_ZIP"
+  fi
+  if [[ -n "$NOTARY_KEY_FILE" && -f "$NOTARY_KEY_FILE" ]]; then
+    rm -f "$NOTARY_KEY_FILE"
+  fi
+}
+trap cleanup EXIT
 
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv
@@ -41,10 +57,51 @@ if [ ! -d "$APP_PATH" ]; then
   exit 1
 fi
 
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  echo "Signing app with identity: $SIGN_IDENTITY"
+  codesign \
+    --force \
+    --deep \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGN_IDENTITY" \
+    "$APP_PATH"
+  codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+fi
+
+if [[ -n "$NOTARY_KEY_ID" || -n "$NOTARY_ISSUER_ID" || -n "$NOTARY_KEY_P8" ]]; then
+  if [[ -z "$SIGN_IDENTITY" ]]; then
+    echo "Notarization requested, but APPLE_SIGN_IDENTITY is missing."
+    exit 1
+  fi
+  if [[ -z "$NOTARY_KEY_ID" || -z "$NOTARY_ISSUER_ID" || -z "$NOTARY_KEY_P8" ]]; then
+    echo "Notarization requested, but one or more notary credentials are missing."
+    echo "Required: APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER_ID, APPLE_NOTARY_KEY_P8"
+    exit 1
+  fi
+
+  echo "Submitting app for notarization..."
+  NOTARY_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/AuthKey_${NOTARY_KEY_ID}_XXXXXX.p8")"
+  chmod 600 "$NOTARY_KEY_FILE"
+  printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_FILE"
+
+  NOTARY_TMP_ZIP="dist/${APP_NAME}-${SAFE_VERSION}-notary.zip"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$NOTARY_TMP_ZIP"
+
+  xcrun notarytool submit "$NOTARY_TMP_ZIP" \
+    --key "$NOTARY_KEY_FILE" \
+    --key-id "$NOTARY_KEY_ID" \
+    --issuer "$NOTARY_ISSUER_ID" \
+    --wait
+
+  xcrun stapler staple "$APP_PATH"
+  xcrun stapler validate "$APP_PATH"
+fi
+
 ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
 
 STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
+trap 'cleanup; rm -rf "$STAGE_DIR"' EXIT
 cp -R "$APP_PATH" "$STAGE_DIR/"
 ln -s /Applications "$STAGE_DIR/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_PATH"
@@ -54,4 +111,3 @@ echo "Build complete"
 echo "- APP: $APP_PATH"
 echo "- ZIP: $ZIP_PATH"
 echo "- DMG: $DMG_PATH"
-
