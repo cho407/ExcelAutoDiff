@@ -1,0 +1,27 @@
+.DS_Store
+
+# Python cache/env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local snapshots and temp outputs
+.snapshots/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.log
+.logs/
+.pip-cache/
+
+# Generated Excel outputs
+*_diff_highlight.xlsx
+*_diff_highlight.xlsm
+report.md
+
+# Local debug launchers
+.tmp_*.command

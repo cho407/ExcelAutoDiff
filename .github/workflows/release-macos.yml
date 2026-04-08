@@ -1,0 +1,60 @@
+name: release-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version label (ex: v1.0.0)"
+        required: false
+        default: "manual"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Build app and dmg
+        shell: bash
+        run: |
+          VERSION_INPUT="${{ github.event.inputs.version }}"
+          if [[ -n "${GITHUB_REF_NAME:-}" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION_LABEL="${GITHUB_REF_NAME}"
+          elif [[ -n "$VERSION_INPUT" ]]; then
+            VERSION_LABEL="$VERSION_INPUT"
+          else
+            VERSION_LABEL="manual"
+          fi
+          chmod +x scripts/build_macos.sh
+          ./scripts/build_macos.sh "$VERSION_LABEL"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-files
+          path: |
+            dist/*.dmg
+            dist/*.zip
+
+      - name: Publish GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.zip
+          generate_release_notes: true
+
