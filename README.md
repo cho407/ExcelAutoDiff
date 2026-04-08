@@ -89,13 +89,6 @@ GUI 흐름:
 - `dist/ExcelAutoDiff-v1.0.0-macOS.zip`
 - `dist/ExcelAutoDiff-v1.0.0-macOS.dmg`
 
-선택 사항(서명/노타라이즈):
-- 환경 변수로 아래 값을 주면 빌드 스크립트가 서명/노타라이즈를 수행합니다.
-  - `APPLE_SIGN_IDENTITY`
-  - `APPLE_NOTARY_KEY_ID`
-  - `APPLE_NOTARY_ISSUER_ID`
-  - `APPLE_NOTARY_KEY_P8`
-
 ### GitHub Releases 배포
 
 이미 포함된 워크플로우:
@@ -107,19 +100,26 @@ GUI 흐름:
 3. Release Assets에 `.dmg`, `.zip` 자동 업로드
 
 주의:
-- `v*` 태그 릴리즈는 GitHub Actions에서 서명 + 노타라이즈를 수행하도록 구성되어 있습니다.
-- 아래 GitHub Secrets가 없으면 태그 릴리즈 작업은 실패하도록 설정되어 있습니다.
-  - `APPLE_SIGN_IDENTITY` (예: `Developer ID Application: <Name> (<TEAMID>)`)
-  - `APPLE_NOTARY_KEY_ID`
-  - `APPLE_NOTARY_ISSUER_ID`
-  - `APPLE_NOTARY_KEY_P8` (App Store Connect API key `.p8` 전체 내용)
-- 외부 배포(일반 사용자 대상) 시 Apple Developer 서명/노타라이즈를 반드시 유지하세요.
+- 현재 배포 파일은 코드 서명/노타라이즈가 포함되어 있지 않습니다.
+
+### macOS 실행 권한 허용(서명 없는 앱)
+
+처음 실행 시 보안 경고가 뜨면 아래 순서로 허용하세요.
+
+1. 앱을 우클릭(또는 Control+클릭) 후 `열기`를 선택합니다.
+2. 경고 창에서 다시 `열기`를 선택합니다.
+3. 막히면 `시스템 설정 > 개인정보 보호 및 보안`으로 이동 후 `그래도 열기`를 선택합니다.
+4. 필요 시 터미널에서 격리 속성(quarantine) 제거 후 다시 실행합니다.
+
+```bash
+xattr -dr com.apple.quarantine "/path/to/ExcelAutoDiff.app"
+```
 
 ## 보안/운영 주의사항
 
 - `report.md`, `.logs/run_gui-*.log`에는 로컬 파일 경로/셀 값 일부가 포함될 수 있으므로 외부 공유 전에 마스킹하세요.
 - 외부에서 받은 신뢰되지 않은 엑셀 파일은 사내/개인 중요 데이터와 분리된 환경에서 검증 후 사용을 권장합니다.
-- 배포 산출물(`.app`, `.zip`, `.dmg`)은 기본적으로 코드 서명/노타라이즈가 없으므로, 외부 공개 배포 전 서명 절차를 권장합니다.
+- 배포 산출물(`.app`, `.zip`, `.dmg`)은 서명/노타라이즈가 없으므로 조직 배포 시 보안 정책에 맞는 검증 절차를 권장합니다.
 
 ### 1) 파일 2개 직접 비교
 

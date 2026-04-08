@@ -17,11 +17,6 @@ permissions:
 jobs:
   build-and-release:
     runs-on: macos-14
-    env:
-      APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
-      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,21 +26,6 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Validate signing/notarization secrets (tag release)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          missing=0
-          for key in APPLE_SIGN_IDENTITY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID APPLE_NOTARY_KEY_P8; do
-            if [[ -z "${!key:-}" ]]; then
-              echo "::error::Missing required secret: $key"
-              missing=1
-            fi
-          done
-          if [[ "$missing" -ne 0 ]]; then
-            exit 1
-          fi
 
       - name: Build app and dmg
         shell: bash
