@@ -22,6 +22,7 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.formula.tokenizer import Tokenizer
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.worksheet.worksheet import Worksheet
 from zipfile import BadZipFile, ZipFile
 
@@ -832,6 +833,17 @@ def compact_summary_text(value: str | None) -> str:
     return text
 
 
+def excel_safe_text(value: str | None) -> str:
+    text = compact_summary_text(value)
+    if not text:
+        return text
+
+    # 요약 시트에서 수식/동적 링크로 재평가되지 않도록 문자열로 강제 저장한다.
+    if text[0] in {"=", "+", "-", "@"} and not text.startswith("'"):
+        return "'" + text
+    return text
+
+
 def add_diff_row(
     summary: HighlightSummary,
     change_type: str,
@@ -844,9 +856,9 @@ def add_diff_row(
         (
             change_type,
             sheet_name,
-            cell_address,
-            compact_summary_text(before),
-            compact_summary_text(after),
+            cell_address.upper(),
+            before or "",
+            after or "",
         )
     )
 
@@ -886,10 +898,79 @@ def write_diff_rows_chunk(
         ws[f"A{row_no}"] = change_label.get(change_type, change_type)
         ws[f"B{row_no}"] = sheet_name
         ws[f"C{row_no}"] = cell_addr
-        ws[f"D{row_no}"] = before_val
-        ws[f"E{row_no}"] = after_val
+        ws[f"D{row_no}"] = excel_safe_text(before_val)
+        ws[f"E{row_no}"] = excel_safe_text(after_val)
         row_no += 1
     return write_count
+
+
+def apply_auto_filter_with_refresh(ws: Worksheet, ref: str) -> None:
+    # 일부 엑셀 버전에서 필터 UI 초기화 타이밍이 늦는 현상을 줄이기 위해
+    # 범위를 한 번 비웠다가 다시 지정해 메타데이터를 안정화한다.
+    ws.auto_filter.ref = None
+    ws.auto_filter.ref = ref
+
+
+def collect_existing_table_names(workbook: Any) -> set[str]:
+    names: set[str] = set()
+    for ws in workbook.worksheets:
+        tables = getattr(ws, "tables", None)
+        if tables:
+            try:
+                names.update(str(name) for name in tables.keys())
+            except Exception:  # noqa: BLE001
+                pass
+        legacy_tables = getattr(ws, "_tables", None)
+        if legacy_tables:
+            try:
+                for table in legacy_tables:
+                    table_name = getattr(table, "name", None)
+                    if table_name:
+                        names.add(str(table_name))
+            except Exception:  # noqa: BLE001
+                pass
+    return names
+
+
+def add_summary_table(ws: Worksheet, ref: str, preferred_name: str, reserved_names: set[str]) -> str:
+    table_name = preferred_name
+    suffix = 2
+    while table_name in reserved_names:
+        table_name = f"{preferred_name}_{suffix}"
+        suffix += 1
+
+    table = Table(displayName=table_name, ref=ref)
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleLight1",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=False,
+        showColumnStripes=False,
+    )
+    ws.add_table(table)
+    reserved_names.add(table_name)
+    return table_name
+
+
+def enforce_single_selected_sheet(workbook: Any, selected_sheet_name: str) -> None:
+    selected_index = 0
+    for idx, ws in enumerate(workbook.worksheets):
+        is_selected = ws.title == selected_sheet_name
+        ws.sheet_view.tabSelected = bool(is_selected)
+        if is_selected:
+            selected_index = idx
+
+    try:
+        workbook.active = selected_index
+    except Exception:  # noqa: BLE001
+        pass
+
+    if getattr(workbook, "views", None):
+        for view in workbook.views:
+            try:
+                view.activeTab = selected_index
+            except Exception:  # noqa: BLE001
+                continue
 
 
 def make_all_visible_and_unprotected(workbook: Any) -> None:
@@ -924,6 +1005,8 @@ def write_highlight_summary_sheet(
     for name in existing_summary_sheets:
         del workbook[name]
 
+    reserved_table_names = collect_existing_table_names(workbook)
+
     ws = workbook.create_sheet(title=summary_name, index=0)
     ws["A1"] = "변경 하이라이트 안내"
     ws["A2"] = "비교 기준 파일"
@@ -949,6 +1032,8 @@ def write_highlight_summary_sheet(
     ws["B14"] = "공통 시트에서 변경 감지"
     ws["A15"] = "초록색 탭"
     ws["B15"] = "2번째 파일에만 있는 신규 시트"
+    ws["A16"] = "필터/정렬 안내"
+    ws["B16"] = "헤더 행 필터에서 구분/시트/셀/이전 값/변경 값 기준 필터 가능"
 
     detail_title_row = 18
     detail_header_row = 19
@@ -966,6 +1051,19 @@ def write_highlight_summary_sheet(
         rows=summary.diff_rows,
         start_row=detail_data_row,
     )
+    if written_count > 0:
+        add_summary_table(
+            ws=ws,
+            ref=f"A{detail_header_row}:E{detail_data_row + written_count - 1}",
+            preferred_name="DiffSummaryTable",
+            reserved_names=reserved_table_names,
+        )
+    else:
+        apply_auto_filter_with_refresh(
+            ws=ws,
+            ref=f"A{detail_header_row}:E{detail_header_row}",
+        )
+
     remaining_rows = summary.diff_rows[written_count:]
 
     page = 2
@@ -986,12 +1084,23 @@ def write_highlight_summary_sheet(
             rows=remaining_rows,
             start_row=4,
         )
+        if chunk_written > 0:
+            add_summary_table(
+                ws=continuation_ws,
+                ref=f"A3:E{3 + chunk_written}",
+                preferred_name=f"DiffSummaryTable_{page}",
+                reserved_names=reserved_table_names,
+            )
+        else:
+            apply_auto_filter_with_refresh(ws=continuation_ws, ref="A3:E3")
         remaining_rows = remaining_rows[chunk_written:]
         page += 1
 
     if page > 2:
-        ws["A16"] = "추가 상세 시트"
-        ws["B16"] = f"{summary_name}_2 ~ {summary_name}_{page - 1}"
+        ws["A17"] = "추가 상세 시트"
+        ws["B17"] = f"{summary_name}_2 ~ {summary_name}_{page - 1}"
+
+    enforce_single_selected_sheet(workbook=workbook, selected_sheet_name=summary_name)
 
 
 def generate_highlight_workbook(

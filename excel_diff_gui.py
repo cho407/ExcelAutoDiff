@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import re
 import sys
 import time
 import traceback
@@ -131,6 +132,8 @@ HANGUL_JUNG_INDEX = {value: idx for idx, value in enumerate(HANGUL_JUNG)}
 HANGUL_JONG_INDEX = {value: idx for idx, value in enumerate(HANGUL_JONG)}
 HANGUL_CHO_SET = set(HANGUL_CHO)
 HANGUL_JUNG_SET = set(HANGUL_JUNG)
+CELL_ADDRESS_RE = re.compile(r"^\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}$")
+CELL_LOOKUP_LOG_LIMIT = 40
 
 
 def now_text() -> str:
@@ -297,185 +300,276 @@ class TerminalConsole(QPlainTextEdit):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
-        self.setCursorWidth(0)
+        self.setUndoRedoEnabled(True)
         self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
 
         self._prompt = "> "
-        self._lines: list[str] = []
-        self._input_raw = ""
-        self._preedit_raw = ""
         self._history: list[str] = []
         self._history_index = 0
-        self._caret_visible = True
-        self._last_rendered = ""
-        self._caret_timer = QTimer(self)
-        self._caret_timer.setInterval(500)
-        self._caret_timer.timeout.connect(self._on_caret_tick)
-        self._caret_timer.start()
-        self._render()
+        self._set_content([], "")
+        QTimer.singleShot(0, self.ensure_input_focus)
 
     def append_log(self, message: str) -> None:
-        self._lines.append(message)
-        overflow = len(self._lines) - LOG_LINE_LIMIT
-        if overflow > 0:
-            del self._lines[:overflow]
-        self._render()
+        scrollbar = self.verticalScrollBar()
+        previous_value = scrollbar.value()
+        previous_max = scrollbar.maximum()
+        was_at_bottom = previous_value >= max(0, previous_max - 2)
+
+        cursor = self.textCursor()
+        input_start = self._input_start_position()
+        if cursor.anchor() >= input_start and cursor.position() >= input_start:
+            anchor_offset = cursor.anchor() - input_start
+            position_offset = cursor.position() - input_start
+        else:
+            anchor_offset = None
+            position_offset = None
+
+        log_lines = self._get_log_lines()
+        for line in str(message).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            log_lines.append(line)
+        if len(log_lines) > LOG_LINE_LIMIT:
+            log_lines = log_lines[-LOG_LINE_LIMIT:]
+
+        current_input = self._current_input_text()
+        self._set_content(log_lines, current_input)
+
+        if anchor_offset is not None and position_offset is not None:
+            new_input_start = self._input_start_position()
+            restored = self.textCursor()
+            anchor_pos = new_input_start + min(max(anchor_offset, 0), len(current_input))
+            position_pos = new_input_start + min(max(position_offset, 0), len(current_input))
+            restored.setPosition(anchor_pos)
+            restored.setPosition(position_pos, QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(restored)
+
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            delta = max(0, scrollbar.maximum() - previous_max)
+            scrollbar.setValue(previous_value + delta)
 
     def clear_logs(self) -> None:
-        self._lines.clear()
-        self._input_raw = ""
-        self._preedit_raw = ""
+        self._set_content([], "")
         self._history_index = len(self._history)
-        self._render()
-
-    def focusInEvent(self, event: Any) -> None:
-        super().focusInEvent(event)
-        self._caret_visible = True
         self.ensure_input_focus()
 
-    def mousePressEvent(self, event: Any) -> None:
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        super().mousePressEvent(event)
-        self.ensure_input_focus()
+    def ensure_input_focus(self) -> None:
+        if not self.hasFocus():
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
 
-    def mouseReleaseEvent(self, event: Any) -> None:
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        super().mouseReleaseEvent(event)
-        self.ensure_input_focus()
+    def _navigate_history(self, direction: int) -> None:
+        if not self._history:
+            return
 
-    def focusOutEvent(self, event: Any) -> None:
-        super().focusOutEvent(event)
-        QTimer.singleShot(0, self._render)
+        if direction < 0 and self._history_index > 0:
+            self._history_index -= 1
+        elif direction > 0 and self._history_index < len(self._history):
+            self._history_index += 1
+        else:
+            return
+
+        if self._history_index >= len(self._history):
+            self._set_current_input_text("")
+            return
+
+        history_item = self._history[self._history_index]
+        self._set_current_input_text(history_item)
 
     def keyPressEvent(self, event: Any) -> None:
         key = event.key()
         modifiers = event.modifiers()
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            command = compose_compat_hangul(self._input_raw + self._preedit_raw)
-            if command:
-                if not self._history or self._history[-1] != command:
-                    self._history.append(command)
-                self._history_index = len(self._history)
-            self._lines.append(f"{self._prompt}{command}")
-            overflow = len(self._lines) - LOG_LINE_LIMIT
-            if overflow > 0:
-                del self._lines[:overflow]
-            self._input_raw = ""
-            self._preedit_raw = ""
-            self._render()
-            self.commandEntered.emit(command)
-            return
-
-        if key == Qt.Key.Key_Backspace:
-            if self._preedit_raw:
-                self._preedit_raw = self._preedit_raw[:-1]
-                self._render()
-            elif self._input_raw:
-                self._input_raw = self._input_raw[:-1]
-                self._render()
-            return
-
-        if key == Qt.Key.Key_Up:
-            if self._history:
-                self._history_index = max(0, self._history_index - 1)
-                self._input_raw = self._history[self._history_index]
-                self._preedit_raw = ""
-                self._render()
-            return
-
-        if key == Qt.Key.Key_Down:
-            if self._history:
-                self._history_index = min(len(self._history), self._history_index + 1)
-                if self._history_index == len(self._history):
-                    self._input_raw = ""
-                else:
-                    self._input_raw = self._history[self._history_index]
-                self._preedit_raw = ""
-                self._render()
-            return
-
-        if key == Qt.Key.Key_Escape:
-            self._input_raw = ""
-            self._preedit_raw = ""
-            self._render()
+            self._submit_current_command()
             return
 
         if (modifiers & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_L:
             self.clear_logs()
             return
 
-        if (modifiers & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_V:
-            clip = QApplication.clipboard().text()
-            if clip:
-                self._input_raw += clip.replace("\r", "").replace("\n", " ")
-                self._preedit_raw = ""
-                self._render()
+        if key == Qt.Key.Key_Up and self._cursor_is_on_input():
+            self._navigate_history(-1)
             return
 
-        if (modifiers & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_C:
-            super().keyPressEvent(event)
+        if key == Qt.Key.Key_Down and self._cursor_is_on_input():
+            self._navigate_history(1)
             return
 
-        text = event.text()
-        if text and not (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier | Qt.KeyboardModifier.AltModifier)):
-            self._input_raw += text.replace("\r", "").replace("\n", "")
-            self._preedit_raw = ""
-            self._render()
+        if key == Qt.Key.Key_Home and not (modifiers & Qt.KeyboardModifier.ControlModifier):
+            cursor = self.textCursor()
+            input_start = self._input_start_position()
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                cursor.setPosition(input_start, QTextCursor.MoveMode.KeepAnchor)
+            else:
+                cursor.setPosition(input_start)
+            self.setTextCursor(cursor)
             return
 
-        event.ignore()
+        if key == Qt.Key.Key_Left and not self.textCursor().hasSelection():
+            if self.textCursor().position() <= self._input_start_position():
+                return
 
-    def inputMethodEvent(self, event: Any) -> None:
-        commit = event.commitString() or ""
-        preedit = event.preeditString() or ""
-        if commit:
-            self._input_raw += commit.replace("\r", "").replace("\n", "")
-        self._preedit_raw = preedit.replace("\r", "").replace("\n", "")
-        self._render()
-        event.accept()
+        if key == Qt.Key.Key_Backspace and not self.textCursor().hasSelection():
+            if self.textCursor().position() <= self._input_start_position():
+                return
 
-    def ensure_input_focus(self) -> None:
-        if not self._has_input_focus():
-            self.setFocus(Qt.FocusReason.OtherFocusReason)
-            self.viewport().setFocus(Qt.FocusReason.OtherFocusReason)
-        self._caret_visible = True
-        self._render()
+        if self._is_editing_key(event):
+            self._prepare_cursor_for_edit()
 
-    def _render(self) -> None:
-        input_text = compose_compat_hangul(self._input_raw + self._preedit_raw)
-        caret = "|" if (self._has_input_focus() and self.isEnabled() and self._caret_visible) else ""
-        lines = [*self._lines, f"{self._prompt}{input_text}{caret}"]
-        rendered = "\n".join(lines)
-        if rendered != self._last_rendered:
-            self._last_rendered = rendered
-            self.setPlainText(rendered)
-            self._move_cursor_to_end()
-        else:
-            self._move_cursor_to_end()
+        super().keyPressEvent(event)
+        self._enforce_cursor_boundary()
+        if self._cursor_is_on_input():
+            self._history_index = len(self._history)
 
-    def _move_cursor_to_end(self) -> None:
+    def insertFromMimeData(self, source: Any) -> None:
+        self._prepare_cursor_for_edit()
+        raw = source.text() if source is not None else ""
+        sanitized = (raw or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        self.textCursor().insertText(sanitized)
+        self._enforce_cursor_boundary()
+        self._history_index = len(self._history)
+
+    def cut(self) -> None:
         cursor = self.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not cursor.hasSelection():
+            return
+        input_start = self._input_start_position()
+        if cursor.selectionEnd() <= input_start:
+            return
+        if cursor.selectionStart() < input_start:
+            cursor.setPosition(input_start)
+            cursor.setPosition(cursor.selectionEnd(), QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(cursor)
+        super().cut()
+        self._enforce_cursor_boundary()
+        self._history_index = len(self._history)
+
+    def _submit_current_command(self) -> None:
+        command = compose_compat_hangul(self._current_input_text())
+        if command:
+            if not self._history or self._history[-1] != command:
+                self._history.append(command)
+        self._history_index = len(self._history)
+
+        log_lines = self._get_log_lines()
+        log_lines.append(f"{self._prompt}{command}")
+        if len(log_lines) > LOG_LINE_LIMIT:
+            log_lines = log_lines[-LOG_LINE_LIMIT:]
+        self._set_content(log_lines, "")
+        self.ensure_input_focus()
+        self.commandEntered.emit(command)
+
+    def _is_editing_key(self, event: Any) -> bool:
+        key = event.key()
+        modifiers = event.modifiers()
+        if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            return True
+        if (modifiers & Qt.KeyboardModifier.ControlModifier) and key in (Qt.Key.Key_V, Qt.Key.Key_X):
+            return True
+        text = event.text()
+        if not text:
+            return False
+        blocked = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier | Qt.KeyboardModifier.AltModifier
+        return not (modifiers & blocked)
+
+    def _prepare_cursor_for_edit(self) -> None:
+        cursor = self.textCursor()
+        input_start = self._input_start_position()
+
+        if cursor.hasSelection():
+            selection_start = cursor.selectionStart()
+            selection_end = cursor.selectionEnd()
+            if selection_end <= input_start:
+                cursor.clearSelection()
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+            elif selection_start < input_start:
+                cursor.setPosition(input_start)
+                cursor.setPosition(selection_end, QTextCursor.MoveMode.KeepAnchor)
+            self.setTextCursor(cursor)
+            return
+
+        if cursor.position() < input_start:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.setTextCursor(cursor)
+
+    def _enforce_cursor_boundary(self) -> None:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return
+        input_start = self._input_start_position()
+        if cursor.position() < input_start:
+            cursor.setPosition(input_start)
+            self.setTextCursor(cursor)
+
+    def _cursor_is_on_input(self) -> bool:
+        cursor = self.textCursor()
+        input_start = self._input_start_position()
+        if cursor.hasSelection():
+            return cursor.selectionStart() >= input_start
+        return cursor.position() >= input_start
+
+    def _set_current_input_text(self, text: str) -> None:
+        sanitized = (text or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        input_start = self._input_start_position()
+        cursor = self.textCursor()
+        cursor.setPosition(input_start)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(sanitized)
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
-    def _on_caret_tick(self) -> None:
-        if not self._has_input_focus() or not self.isEnabled():
-            self._caret_visible = False
-            self._render()
-            return
-        self._caret_visible = not self._caret_visible
-        self._render()
+    def _current_input_text(self) -> str:
+        text = self.toPlainText()
+        input_start = self._input_start_position()
+        return text[input_start:]
 
-    def _has_input_focus(self) -> bool:
-        focus_widget = QApplication.focusWidget()
-        return (
-            self.hasFocus()
-            or self.viewport().hasFocus()
-            or focus_widget is self
-            or focus_widget is self.viewport()
-        )
+    def _get_log_lines(self) -> list[str]:
+        text = self.toPlainText()
+        if not text:
+            return []
+        line_start = text.rfind("\n") + 1
+        last_line = text[line_start:]
+        if last_line.startswith(self._prompt):
+            logs_text = text[: max(0, line_start - 1)]
+        else:
+            logs_text = text
+        if not logs_text:
+            return []
+        return logs_text.split("\n")
+
+    def _set_content(self, log_lines: list[str], input_text: str) -> None:
+        cleaned_lines: list[str] = []
+        for raw in log_lines:
+            for line in str(raw).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                cleaned_lines.append(line)
+        if len(cleaned_lines) > LOG_LINE_LIMIT:
+            cleaned_lines = cleaned_lines[-LOG_LINE_LIMIT:]
+
+        sanitized_input = (input_text or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        rendered_lines = [*cleaned_lines, f"{self._prompt}{sanitized_input}"]
+        self.setPlainText("\n".join(rendered_lines))
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+
+    def _input_start_position(self) -> int:
+        text = self.toPlainText()
+        line_start = text.rfind("\n") + 1
+        if text[line_start:].startswith(self._prompt):
+            return line_start + len(self._prompt)
+
+        # 예상치 못한 편집으로 프롬프트가 깨졌으면 현재 마지막 줄을 입력으로 보존해 복구
+        raw_input = text[line_start:]
+        logs_text = text[: max(0, line_start - 1)]
+        log_lines = logs_text.split("\n") if logs_text else []
+        self._set_content(log_lines, raw_input)
+        restored = self.toPlainText()
+        restored_line_start = restored.rfind("\n") + 1
+        return restored_line_start + len(self._prompt)
 
 
 class CompareWorker(QObject):
@@ -512,6 +606,7 @@ class CompareWorker(QObject):
                 "added_cells": summary.added_cells,
                 "removed_cells": summary.removed_cells,
                 "changed_sheets": summary.changed_sheets,
+                "diff_rows": summary.diff_rows,
             }
             self.finished.emit(payload)
         except Exception as exc:  # noqa: BLE001
@@ -537,6 +632,9 @@ class ExcelDiffMainWindow(QMainWindow):
         self.target_folder_files: list[Path] = []
         self.base_choice_map: dict[str, Path] = {}
         self.target_choice_map: dict[str, Path] = {}
+        self.last_diff_rows: list[tuple[str, str, str, str, str]] = []
+        self.last_diff_by_cell: dict[str, list[tuple[str, str, str, str, str]]] = {}
+        self.last_diff_by_sheet_cell: dict[str, list[tuple[str, str, str, str, str]]] = {}
 
         self.worker_thread: QThread | None = None
         self.worker: CompareWorker | None = None
@@ -556,7 +654,7 @@ class ExcelDiffMainWindow(QMainWindow):
         self._apply_styles()
         self._initialize_dropdown_sources()
         self._append_log("준비 완료. 기준 파일과 비교 파일을 선택한 뒤 [비교 실행]을 누르세요.")
-        self._append_log("콘솔 명령어: run, clear, reset, help")
+        self._append_log("콘솔 명령어: run, clear, reset, help, find <키워드>, <셀주소>, <시트명>!<셀주소>")
         QTimer.singleShot(0, self.log_view.setFocus)
 
     def _build_ui(self) -> None:
@@ -703,20 +801,24 @@ class ExcelDiffMainWindow(QMainWindow):
         action_layout.addWidget(self.clear_log_button)
         main.addWidget(action_card)
 
-        status_row = QHBoxLayout()
-        status_row.setSpacing(8)
+        status_card = self._make_card()
+        status_layout = QHBoxLayout(status_card)
+        status_layout.setContentsMargins(12, 6, 12, 6)
+        status_layout.setSpacing(8)
+        status_card.setMinimumHeight(38)
 
         self.progress_label = QLabel("")
         self.progress_label.setObjectName("mutedText")
+        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
         self.status_label = QLabel("준비됨")
         self.status_label.setProperty("statusText", True)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
 
-        status_row.addWidget(self.progress_label)
-        status_row.addStretch(1)
-        status_row.addWidget(self.status_label)
+        status_layout.addWidget(self.progress_label, 1)
+        status_layout.addWidget(self.status_label, 0)
 
-        main.addLayout(status_row)
+        main.addWidget(status_card)
 
         log_card = self._make_card()
         log_layout = QVBoxLayout(log_card)
@@ -953,6 +1055,7 @@ class ExcelDiffMainWindow(QMainWindow):
 
     def _on_console_command_entered(self, raw: str) -> None:
         try:
+            raw_command = self._normalize_console_text(raw).strip("`'\".,!?")
             command = normalize_command_text(raw).strip("`'\".,!?")
             command_lower = command.lower()
             easter_egg = normalize_command_text(EASTER_EGG_COMMAND)
@@ -982,7 +1085,14 @@ class ExcelDiffMainWindow(QMainWindow):
                 return
 
             if command_lower in {"help", "?"}:
-                self._append_log("명령어: run, clear, reset")
+                self._append_log("명령어: run, clear, reset, find <키워드>, <셀주소>, <시트명>!<셀주소>")
+                self._append_log("예시: find 차량명 / B12 / 견적서!B12")
+                return
+
+            if self._handle_search_command(raw_command):
+                return
+
+            if self._handle_cell_lookup_command(raw_command):
                 return
 
             self._append_log(f"알 수 없는 명령: {raw}")
@@ -1368,11 +1478,175 @@ class ExcelDiffMainWindow(QMainWindow):
     def _clear_log(self) -> None:
         self.log_view.clear_logs()
 
+    def _normalize_console_text(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFC", text or "")
+        normalized = (
+            normalized.replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\ufeff", "")
+            .strip()
+        )
+        normalized = compose_compat_hangul(normalized)
+        if normalized.startswith(">"):
+            normalized = normalized[1:].strip()
+        return normalized
+
+    def _normalize_cell_address_input(self, text: str) -> str:
+        candidate = text.strip().upper().replace("$", "")
+        if not CELL_ADDRESS_RE.fullmatch(candidate):
+            return ""
+        return candidate
+
+    def _normalize_lookup_key(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFC", text or "").casefold()
+        normalized = compose_compat_hangul(normalized)
+        normalized = re.sub(r"[\s!,:;|/\\]+", " ", normalized).strip()
+        return normalized
+
+    def _normalize_exact_match_key(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFC", text or "")
+        normalized = compose_compat_hangul(normalized)
+        normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(r"\s+", " ", normalized).strip().casefold()
+        return normalized
+
+    def _safe_console_value(self, value: str) -> str:
+        text = (value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ⏎ ").strip()
+        if not text:
+            return "(빈값)"
+        if len(text) > 140:
+            return text[:140] + "..."
+        return text
+
+    def _set_last_diff_rows(self, rows: Any) -> None:
+        self.last_diff_rows = []
+        self.last_diff_by_cell = {}
+        self.last_diff_by_sheet_cell = {}
+
+        if not isinstance(rows, list):
+            return
+
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != 5:
+                continue
+            change_type, sheet_name, cell_addr, before_val, after_val = row
+            sheet = str(sheet_name or "")
+            cell = self._normalize_cell_address_input(str(cell_addr or ""))
+            if not cell:
+                continue
+            record = (
+                str(change_type or ""),
+                sheet,
+                cell,
+                str(before_val or ""),
+                str(after_val or ""),
+            )
+            self.last_diff_rows.append(record)
+            self.last_diff_by_cell.setdefault(cell, []).append(record)
+            sheet_key = f"{self._normalize_lookup_key(sheet)}!{cell}"
+            self.last_diff_by_sheet_cell.setdefault(sheet_key, []).append(record)
+
+    def _render_lookup_results(
+        self,
+        records: list[tuple[str, str, str, str, str]],
+        title: str,
+    ) -> None:
+        if not records:
+            self._append_log(f"{title}: 결과 없음")
+            return
+
+        change_label = {"modified": "수정", "added": "추가", "removed": "삭제"}
+        total = len(records)
+        self._append_log(f"{title}: {total}건")
+
+        for change_type, sheet_name, cell_addr, before_val, after_val in records[:CELL_LOOKUP_LOG_LIMIT]:
+            label = change_label.get(change_type, change_type)
+            before_text = self._safe_console_value(before_val)
+            after_text = self._safe_console_value(after_val)
+            self._append_log(
+                f"[{label}] {sheet_name}!{cell_addr} | 이전: {before_text} | 변경: {after_text}"
+            )
+
+        if total > CELL_LOOKUP_LOG_LIMIT:
+            self._append_log(f"... {total - CELL_LOOKUP_LOG_LIMIT}건 더 있음")
+
+    def _handle_search_command(self, raw_command: str) -> bool:
+        parts = raw_command.split(maxsplit=1)
+        if not parts:
+            return False
+
+        head = normalize_command_text(parts[0]).lower()
+        if head not in {"find", "search", "검색"}:
+            return False
+
+        if len(parts) < 2 or not parts[1].strip():
+            self._append_log("검색어를 입력해주세요. 예: find 할인")
+            return True
+
+        if not self.last_diff_rows:
+            self._append_log("최근 실행 결과가 없습니다. 먼저 run으로 비교를 실행하세요.")
+            return True
+
+        keyword = parts[1].strip()
+        needle = self._normalize_exact_match_key(keyword)
+        matches: list[tuple[str, str, str, str, str]] = []
+        change_label = {"modified": "수정", "added": "추가", "removed": "삭제"}
+
+        for record in self.last_diff_rows:
+            change_type, sheet_name, cell_addr, before_val, after_val = record
+            candidates = {
+                self._normalize_exact_match_key(change_type),
+                self._normalize_exact_match_key(change_label.get(change_type, change_type)),
+                self._normalize_exact_match_key(sheet_name),
+                self._normalize_exact_match_key(cell_addr),
+                self._normalize_exact_match_key(f"{sheet_name}!{cell_addr}"),
+                self._normalize_exact_match_key(before_val),
+                self._normalize_exact_match_key(after_val),
+            }
+            if needle in candidates:
+                matches.append(record)
+
+        self._render_lookup_results(matches, f"검색 '{keyword}'")
+        return True
+
+    def _handle_cell_lookup_command(self, raw_command: str) -> bool:
+        if not raw_command:
+            return False
+
+        if "!" in raw_command:
+            sheet_raw, cell_raw = raw_command.rsplit("!", 1)
+            sheet_name = sheet_raw.strip()
+            cell = self._normalize_cell_address_input(cell_raw)
+            if not sheet_name or not cell:
+                return False
+            if not self.last_diff_rows:
+                self._append_log("최근 실행 결과가 없습니다. 먼저 run으로 비교를 실행하세요.")
+                return True
+            sheet_key = f"{self._normalize_lookup_key(sheet_name)}!{cell}"
+            records = self.last_diff_by_sheet_cell.get(sheet_key, [])
+            self._render_lookup_results(records, f"조회 {sheet_name}!{cell}")
+            return True
+
+        cell = self._normalize_cell_address_input(raw_command)
+        if not cell:
+            return False
+        if not self.last_diff_rows:
+            self._append_log("최근 실행 결과가 없습니다. 먼저 run으로 비교를 실행하세요.")
+            return True
+
+        records = self.last_diff_by_cell.get(cell, [])
+        self._render_lookup_results(records, f"조회 {cell}")
+        return True
+
     def _reset_inputs(self) -> None:
         if self.running:
             self._append_log("실행 중에는 reset 명령을 사용할 수 없습니다.")
             return
 
+        self.last_diff_rows = []
+        self.last_diff_by_cell = {}
+        self.last_diff_by_sheet_cell = {}
         self.base_file = None
         self.target_file = None
         self.output_file = None
@@ -1770,6 +2044,7 @@ class ExcelDiffMainWindow(QMainWindow):
         self.worker_thread.start()
 
     def _on_worker_finished(self, payload: dict[str, Any]) -> None:
+        self._set_last_diff_rows(payload.get("diff_rows", []))
         self._append_log("하이라이트 파일 생성 완료")
         self._append_log(
             "- 수정 셀: {modified_cells}, 추가 셀: {added_cells}, 삭제 셀: {removed_cells}".format(
@@ -1778,6 +2053,7 @@ class ExcelDiffMainWindow(QMainWindow):
                 removed_cells=payload.get("removed_cells", 0),
             )
         )
+        self._append_log(f"- 셀 조회 인덱스 준비: {len(self.last_diff_rows)}건")
 
         changed_sheets = payload.get("changed_sheets", [])
         if changed_sheets:
