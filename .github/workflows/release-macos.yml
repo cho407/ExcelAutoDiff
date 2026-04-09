@@ -57,3 +57,4 @@ jobs:
             dist/*.dmg
             dist/*.zip
           generate_release_notes: true
+          make_latest: true
