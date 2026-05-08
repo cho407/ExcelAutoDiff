@@ -59,6 +59,7 @@ SHEET_REF_QUOTED_RE = re.compile(r"'((?:''|[^'])+)'!")
 OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+EXTERNAL_LINK_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink"
 
 
 @dataclass(frozen=True)
@@ -310,8 +311,7 @@ def extract_cells(ws: Worksheet, include_format: bool) -> dict[str, CellSnapshot
     cells: dict[str, CellSnapshot] = {}
     internal_cells = getattr(ws, "_cells", None)
     if internal_cells:
-        for row, col in sorted(internal_cells.keys()):
-            cell = internal_cells[(row, col)]
+        for (row, col), cell in internal_cells.items():
             snapshot = make_cell_snapshot(cell, include_format=include_format)
             if snapshot is None:
                 continue
@@ -1041,6 +1041,24 @@ def relationship_tag(name: str) -> str:
     return f"{{{PACKAGE_REL_NS}}}{name}"
 
 
+def rel_id_number(rel_id: str | None) -> int:
+    if not rel_id or not rel_id.startswith("rId"):
+        return 0
+    suffix = rel_id[3:]
+    return int(suffix) if suffix.isdigit() else 0
+
+
+def next_relationship_id(rels_root: ET.Element) -> str:
+    used = {
+        rel.get("Id", "")
+        for rel in rels_root.findall(relationship_tag("Relationship"))
+    }
+    next_id = max((rel_id_number(rel_id) for rel_id in used), default=0) + 1
+    while f"rId{next_id}" in used:
+        next_id += 1
+    return f"rId{next_id}"
+
+
 def workbook_sheet_path(target: str) -> str:
     if target.startswith("/"):
         return posixpath.normpath(target.lstrip("/"))
@@ -1075,6 +1093,172 @@ def changed_cells_by_sheet(
     return result
 
 
+def collect_external_link_parts(source_zip: ZipFile) -> tuple[bytes | None, bytes | None, dict[str, bytes]]:
+    source_names = set(source_zip.namelist())
+    workbook_xml = source_zip.read("xl/workbook.xml") if "xl/workbook.xml" in source_names else None
+    workbook_rels = (
+        source_zip.read("xl/_rels/workbook.xml.rels")
+        if "xl/_rels/workbook.xml.rels" in source_names
+        else None
+    )
+    parts = {
+        name: source_zip.read(name)
+        for name in source_names
+        if name.startswith("xl/externalLinks/")
+    }
+    return workbook_xml, workbook_rels, parts
+
+
+def worksheet_has_external_formula(sheet_data: bytes) -> bool:
+    if b"<f" not in sheet_data or b"[" not in sheet_data:
+        return False
+
+    try:
+        root = ET.fromstring(sheet_data)
+    except Exception:  # noqa: BLE001
+        return True
+
+    for formula in root.findall(f".//{ooxml_tag('f')}"):
+        if "[" in (formula.text or ""):
+            return True
+    return False
+
+
+def collect_external_formula_sheet_data(source_zip: ZipFile) -> dict[str, bytes]:
+    source_names = set(source_zip.namelist())
+    source_sheet_file_map = build_sheet_file_map(source_zip)
+    source_sheet_data_by_name: dict[str, bytes] = {}
+
+    for sheet_name, sheet_file in source_sheet_file_map.items():
+        if not sheet_file.startswith("xl/worksheets/") or sheet_file not in source_names:
+            continue
+
+        sheet_data = source_zip.read(sheet_file)
+        if worksheet_has_external_formula(sheet_data):
+            source_sheet_data_by_name[sheet_name] = sheet_data
+
+    return source_sheet_data_by_name
+
+
+def copy_content_type_overrides(
+    target_content_types: bytes,
+    source_content_types: bytes | None,
+    copied_part_names: set[str],
+) -> bytes:
+    if source_content_types is None or not copied_part_names:
+        return target_content_types
+
+    target_root = ET.fromstring(target_content_types)
+    source_root = ET.fromstring(source_content_types)
+    existing_part_names = {
+        override.get("PartName")
+        for override in target_root.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override")
+    }
+
+    for override in source_root.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override"):
+        part_name = override.get("PartName")
+        normalized_part = part_name.lstrip("/") if part_name else ""
+        if normalized_part in copied_part_names and part_name not in existing_part_names:
+            target_root.append(deepcopy(override))
+            existing_part_names.add(part_name)
+
+    return ET.tostring(target_root, encoding="utf-8", xml_declaration=True)
+
+
+def insert_external_references(workbook_root: ET.Element, external_references: ET.Element) -> None:
+    for existing in workbook_root.findall(ooxml_tag("externalReferences")):
+        workbook_root.remove(existing)
+
+    children = list(workbook_root)
+    insert_after_tags = {
+        ooxml_tag("fileVersion"),
+        ooxml_tag("fileSharing"),
+        ooxml_tag("workbookPr"),
+        ooxml_tag("workbookProtection"),
+        ooxml_tag("bookViews"),
+        ooxml_tag("sheets"),
+        ooxml_tag("functionGroups"),
+    }
+
+    insert_index = 0
+    for index, child in enumerate(children):
+        if child.tag in insert_after_tags:
+            insert_index = index + 1
+    workbook_root.insert(insert_index, external_references)
+
+
+def restore_external_link_references(
+    target_workbook_xml: bytes,
+    target_workbook_rels: bytes,
+    source_workbook_xml: bytes | None,
+    source_workbook_rels: bytes | None,
+) -> tuple[bytes, bytes]:
+    if source_workbook_xml is None or source_workbook_rels is None:
+        return target_workbook_xml, target_workbook_rels
+
+    source_wb_root = ET.fromstring(source_workbook_xml)
+    source_refs = source_wb_root.find(ooxml_tag("externalReferences"))
+    if source_refs is None or not list(source_refs):
+        return target_workbook_xml, target_workbook_rels
+
+    source_rels_root = ET.fromstring(source_workbook_rels)
+    source_rels = {
+        rel.get("Id"): rel
+        for rel in source_rels_root.findall(relationship_tag("Relationship"))
+        if rel.get("Type") == EXTERNAL_LINK_REL_TYPE
+    }
+    if not source_rels:
+        return target_workbook_xml, target_workbook_rels
+
+    target_wb_root = ET.fromstring(target_workbook_xml)
+    target_rels_root = ET.fromstring(target_workbook_rels)
+    for rel in list(target_rels_root.findall(relationship_tag("Relationship"))):
+        if rel.get("Type") == EXTERNAL_LINK_REL_TYPE:
+            target_rels_root.remove(rel)
+
+    restored_refs = ET.Element(ooxml_tag("externalReferences"))
+
+    for source_ref in source_refs.findall(ooxml_tag("externalReference")):
+        source_rel_id = source_ref.get(f"{{{OOXML_REL_NS}}}id")
+        source_rel = source_rels.get(source_rel_id)
+        if source_rel is None:
+            continue
+
+        new_rel_id = next_relationship_id(target_rels_root)
+        ET.SubElement(
+            target_rels_root,
+            relationship_tag("Relationship"),
+            {
+                "Id": new_rel_id,
+                "Type": EXTERNAL_LINK_REL_TYPE,
+                "Target": source_rel.get("Target", ""),
+            },
+        )
+        restored_ref = deepcopy(source_ref)
+        restored_ref.set(f"{{{OOXML_REL_NS}}}id", new_rel_id)
+        restored_refs.append(restored_ref)
+
+    if not list(restored_refs):
+        return target_workbook_xml, target_workbook_rels
+
+    insert_external_references(target_wb_root, restored_refs)
+    return (
+        ET.tostring(target_wb_root, encoding="utf-8", xml_declaration=True),
+        ET.tostring(target_rels_root, encoding="utf-8", xml_declaration=True),
+    )
+
+
+def cell_reference_parts(ref: str) -> tuple[int, int]:
+    match = CELL_COORD_RE.match(ref.upper())
+    if not match:
+        return sys.maxsize, sys.maxsize
+    col_letters, row_text = match.groups()
+    col_index = 0
+    for char in col_letters:
+        col_index = col_index * 26 + (ord(char) - ord("A") + 1)
+    return int(row_text), col_index
+
+
 def set_fill_to_white(fill_node: ET.Element) -> None:
     fill_node.clear()
     pattern = ET.SubElement(fill_node, ooxml_tag("patternFill"), {"patternType": "solid"})
@@ -1103,7 +1287,42 @@ def force_font_color_black(fonts_node: ET.Element | None) -> None:
             color.set("rgb", "FF000000")
 
 
-def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, Any] | None:
+def element_fingerprint(node: ET.Element) -> tuple[Any, ...]:
+    return (
+        node.tag,
+        tuple(sorted(node.attrib.items())),
+        tuple(element_fingerprint(child) for child in list(node)),
+        node.text or "",
+    )
+
+
+def compact_cell_xfs_for_safe_highlights(cell_xfs: ET.Element) -> dict[int, int]:
+    xf_nodes = cell_xfs.findall(ooxml_tag("xf"))
+    style_remap: dict[int, int] = {}
+    fingerprints: dict[tuple[Any, ...], int] = {}
+    compacted_xfs: list[ET.Element] = []
+
+    for old_index, xf in enumerate(xf_nodes):
+        compact_xf = deepcopy(xf)
+        compact_xf.set("fillId", "0")
+        compact_xf.set("applyFill", "0")
+        fingerprint = element_fingerprint(compact_xf)
+        new_index = fingerprints.get(fingerprint)
+        if new_index is None:
+            new_index = len(compacted_xfs)
+            fingerprints[fingerprint] = new_index
+            compacted_xfs.append(compact_xf)
+        style_remap[old_index] = new_index
+
+    for child in list(cell_xfs):
+        cell_xfs.remove(child)
+    for xf in compacted_xfs:
+        cell_xfs.append(xf)
+    cell_xfs.set("count", str(len(compacted_xfs)))
+    return style_remap
+
+
+def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, Any, dict[int, int]] | None:
     ET.register_namespace("", OOXML_MAIN_NS)
     ET.register_namespace("r", OOXML_REL_NS)
 
@@ -1119,6 +1338,7 @@ def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, 
             set_fill_to_white(fill)
 
     force_font_color_black(root.find(ooxml_tag("fonts")))
+    style_remap = compact_cell_xfs_for_safe_highlights(cell_xfs)
 
     highlight_fill_ids = {
         "modified": append_solid_fill(fills, "FFFFF2CC"),
@@ -1130,11 +1350,16 @@ def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, 
     style_cache: dict[tuple[int, str], int] = {}
 
     def highlighted_style(base_style_id: int, change_type: str) -> int:
-        key = (base_style_id, change_type)
+        compact_base_style_id = style_remap.get(base_style_id, 0)
+        key = (compact_base_style_id, change_type)
         if key in style_cache:
             return style_cache[key]
 
-        base = xf_nodes[base_style_id] if 0 <= base_style_id < len(xf_nodes) else xf_nodes[0]
+        base = (
+            xf_nodes[compact_base_style_id]
+            if 0 <= compact_base_style_id < len(xf_nodes)
+            else xf_nodes[0]
+        )
         new_xf = deepcopy(base)
         new_xf.set("fillId", str(highlight_fill_ids.get(change_type, highlight_fill_ids["modified"])))
         new_xf.set("applyFill", "1")
@@ -1145,31 +1370,57 @@ def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, 
         cell_xfs.set("count", str(len(xf_nodes)))
         return new_style_id
 
-    return root, highlighted_style
+    return root, highlighted_style, style_remap
 
 
 def patch_worksheet_highlight_styles(
     sheet_data: bytes,
     cell_changes: dict[str, str],
     style_factory: Any,
+    style_remap: dict[int, int],
+    source_sheet_data: bytes | None = None,
 ) -> bytes:
-    if not cell_changes:
+    if not cell_changes and not style_remap:
         return sheet_data
 
     root = ET.fromstring(sheet_data)
+    if source_sheet_data is not None:
+        restore_source_formula_records(root, source_sheet_data)
+
+    for col in root.findall(f".//{ooxml_tag('col')}"):
+        raw_style = col.get("style")
+        if raw_style is None:
+            continue
+        try:
+            base_style_id = int(raw_style)
+        except ValueError:
+            base_style_id = 0
+        col.set("style", str(style_remap.get(base_style_id, 0)))
+
+    for row in root.findall(f".//{ooxml_tag('row')}"):
+        raw_style = row.get("s")
+        if raw_style is None:
+            continue
+        try:
+            base_style_id = int(raw_style)
+        except ValueError:
+            base_style_id = 0
+        row.set("s", str(style_remap.get(base_style_id, 0)))
+
     found_refs: set[str] = set()
     for cell in root.findall(f".//{ooxml_tag('c')}"):
         ref = (cell.get("r") or "").upper()
         change_type = cell_changes.get(ref)
-        if not change_type:
-            continue
-
-        found_refs.add(ref)
         try:
             base_style_id = int(cell.get("s", "0"))
         except ValueError:
             base_style_id = 0
-        cell.set("s", str(style_factory(base_style_id, change_type)))
+
+        if change_type:
+            found_refs.add(ref)
+            cell.set("s", str(style_factory(base_style_id, change_type)))
+        else:
+            cell.set("s", str(style_remap.get(base_style_id, 0)))
 
     missing_refs = sorted(set(cell_changes) - found_refs, key=cell_sort_key)
     if missing_refs:
@@ -1221,12 +1472,108 @@ def patch_worksheet_highlight_styles(
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+def patch_worksheet_formula_records(
+    sheet_data: bytes,
+    source_sheet_data: bytes | None,
+) -> bytes:
+    if source_sheet_data is None:
+        return sheet_data
+
+    root = ET.fromstring(sheet_data)
+    restore_source_formula_records(root, source_sheet_data)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def get_or_create_row(sheet_data_node: ET.Element, row_idx: int) -> ET.Element:
+    for row in sheet_data_node.findall(ooxml_tag("row")):
+        if row.get("r") == str(row_idx):
+            return row
+
+    row = ET.Element(ooxml_tag("row"), {"r": str(row_idx)})
+    inserted = False
+    for index, existing_row in enumerate(list(sheet_data_node)):
+        existing_idx = int(existing_row.get("r", "0")) if existing_row.get("r", "0").isdigit() else 0
+        if existing_idx > row_idx:
+            sheet_data_node.insert(index, row)
+            inserted = True
+            break
+    if not inserted:
+        sheet_data_node.append(row)
+    return row
+
+
+def get_or_create_cell(sheet_data_node: ET.Element, ref: str) -> ET.Element | None:
+    row_idx, col_idx = cell_reference_parts(ref)
+    if row_idx == sys.maxsize:
+        return None
+
+    row = get_or_create_row(sheet_data_node, row_idx)
+    for cell in row.findall(ooxml_tag("c")):
+        if (cell.get("r") or "").upper() == ref.upper():
+            return cell
+
+    new_cell = ET.Element(ooxml_tag("c"), {"r": ref.upper()})
+    inserted = False
+    for index, existing_cell in enumerate(list(row)):
+        existing_ref = (existing_cell.get("r") or "").upper()
+        _existing_row, existing_col = cell_reference_parts(existing_ref)
+        if existing_col > col_idx:
+            row.insert(index, new_cell)
+            inserted = True
+            break
+    if not inserted:
+        row.append(new_cell)
+    return new_cell
+
+
+def restore_source_formula_records(root: ET.Element, source_sheet_data: bytes) -> None:
+    source_root = ET.fromstring(source_sheet_data)
+    sheet_data_node = root.find(ooxml_tag("sheetData"))
+    if sheet_data_node is None:
+        return
+
+    target_cells_by_ref = {
+        (cell.get("r") or "").upper(): cell
+        for cell in root.findall(f".//{ooxml_tag('c')}")
+        if cell.get("r")
+    }
+
+    for source_cell in source_root.findall(f".//{ooxml_tag('c')}"):
+        if source_cell.find(ooxml_tag("f")) is None:
+            continue
+        ref = (source_cell.get("r") or "").upper()
+        if not ref:
+            continue
+
+        target_cell = target_cells_by_ref.get(ref)
+        if target_cell is None:
+            target_cell = get_or_create_cell(sheet_data_node, ref)
+            if target_cell is not None:
+                target_cells_by_ref[ref] = target_cell
+        if target_cell is None:
+            continue
+
+        target_style = target_cell.get("s", source_cell.get("s", "0"))
+        target_cell.attrib.clear()
+        for key, value in source_cell.attrib.items():
+            if key != "s":
+                target_cell.set(key, value)
+        target_cell.set("s", target_style)
+
+        for child in list(target_cell):
+            target_cell.remove(child)
+        for child in list(source_cell):
+            target_cell.append(deepcopy(child))
+
+
 def apply_style_safe_highlight_patch(
     output_file: Path,
     diff_rows: list[tuple[str, str, str, str, str]],
+    source_file: Path | None = None,
+    style_safe_mode: bool = True,
 ) -> None:
     changes = changed_cells_by_sheet(diff_rows)
-    if not changes:
+    if not changes and source_file is None:
         return
 
     temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
@@ -1238,29 +1585,96 @@ def apply_style_safe_highlight_patch(
             if sheet_name in sheet_file_map
         }
 
-        prepared_styles = prepare_styles_for_safe_highlights(zin.read("xl/styles.xml"))
-        if prepared_styles is None:
-            return
-        styles_root, style_factory = prepared_styles
+        patched_styles: bytes | None = None
+        style_factory: Any | None = None
+        style_remap: dict[int, int] = {}
+        if style_safe_mode:
+            prepared_styles = prepare_styles_for_safe_highlights(zin.read("xl/styles.xml"))
+            if prepared_styles is None:
+                return
+            styles_root, style_factory, style_remap = prepared_styles
 
+        source_workbook_xml = None
+        source_workbook_rels = None
+        source_content_types = None
+        source_external_link_parts: dict[str, bytes] = {}
+        source_sheet_data_by_name: dict[str, bytes] = {}
+        if source_file is not None:
+            try:
+                with ZipFile(source_file, "r") as source_zip:
+                    (
+                        source_workbook_xml,
+                        source_workbook_rels,
+                        source_external_link_parts,
+                    ) = collect_external_link_parts(source_zip)
+                    if "[Content_Types].xml" in source_zip.namelist():
+                        source_content_types = source_zip.read("[Content_Types].xml")
+                    source_sheet_data_by_name = collect_external_formula_sheet_data(source_zip)
+            except Exception:  # noqa: BLE001
+                source_workbook_xml = None
+                source_workbook_rels = None
+                source_content_types = None
+                source_external_link_parts = {}
+                source_sheet_data_by_name = {}
+
+        sheet_name_by_file = {sheet_file: sheet_name for sheet_name, sheet_file in sheet_file_map.items()}
         patched_sheets: dict[str, bytes] = {}
-        for sheet_file, cell_changes in sheet_changes_by_file.items():
-            patched_sheets[sheet_file] = patch_worksheet_highlight_styles(
-                zin.read(sheet_file),
-                cell_changes,
-                style_factory,
+        for sheet_file in set(sheet_file_map.values()):
+            if not sheet_file.startswith("xl/worksheets/"):
+                continue
+            sheet_name = sheet_name_by_file.get(sheet_file, "")
+            source_sheet_data = source_sheet_data_by_name.get(sheet_name)
+            if style_safe_mode:
+                patched_sheets[sheet_file] = patch_worksheet_highlight_styles(
+                    zin.read(sheet_file),
+                    sheet_changes_by_file.get(sheet_file, {}),
+                    style_factory,
+                    style_remap,
+                    source_sheet_data,
+                )
+            elif source_sheet_data is not None:
+                patched_sheets[sheet_file] = patch_worksheet_formula_records(
+                    zin.read(sheet_file),
+                    source_sheet_data,
+                )
+
+        if style_safe_mode:
+            patched_styles = ET.tostring(styles_root, encoding="utf-8", xml_declaration=True)
+        patched_workbook_xml: bytes | None = None
+        patched_workbook_rels: bytes | None = None
+        if "xl/workbook.xml" in zin.namelist() and "xl/_rels/workbook.xml.rels" in zin.namelist():
+            patched_workbook_xml, patched_workbook_rels = restore_external_link_references(
+                zin.read("xl/workbook.xml"),
+                zin.read("xl/_rels/workbook.xml.rels"),
+                source_workbook_xml,
+                source_workbook_rels,
             )
 
-        patched_styles = ET.tostring(styles_root, encoding="utf-8", xml_declaration=True)
-
         with ZipFile(temp_file, "w") as zout:
+            written_names: set[str] = set()
             for info in zin.infolist():
                 data = zin.read(info.filename)
-                if info.filename == "xl/styles.xml":
+                if info.filename == "xl/styles.xml" and patched_styles is not None:
                     data = patched_styles
+                elif info.filename == "xl/workbook.xml" and patched_workbook_xml is not None:
+                    data = patched_workbook_xml
+                elif info.filename == "xl/_rels/workbook.xml.rels" and patched_workbook_rels is not None:
+                    data = patched_workbook_rels
+                elif info.filename == "[Content_Types].xml":
+                    data = copy_content_type_overrides(
+                        data,
+                        source_content_types,
+                        set(source_external_link_parts),
+                    )
                 elif info.filename in patched_sheets:
                     data = patched_sheets[info.filename]
                 zout.writestr(info, data)
+                written_names.add(info.filename)
+
+            for name, data in source_external_link_parts.items():
+                if name not in written_names:
+                    zout.writestr(name, data)
+                    written_names.add(name)
 
     temp_file.replace(output_file)
 
@@ -1421,12 +1835,11 @@ def generate_highlight_workbook(
             raise RuntimeError(right_error)
 
         try:
-            style_safe_mode = should_use_style_safe_mode(prepared_right)
+            # 대량 셀 스타일 변경은 openpyxl 객체를 하나씩 수정하면 큰 파일에서 매우 느리고
+            # 스타일 수가 쉽게 불어난다. 색상 정리/하이라이트는 저장 후 OOXML 패치로 통일한다.
+            style_safe_mode = True
             make_all_visible_and_unprotected(right_wb)
-            if not style_safe_mode:
-                normalize_workbook_visual_to_white_black(right_wb)
-            else:
-                clear_workbook_visual_overlays(right_wb)
+            clear_workbook_visual_overlays(right_wb)
 
             left_sheets = set(left_wb.sheetnames)
             right_sheets = set(right_wb.sheetnames)
@@ -1569,8 +1982,12 @@ def generate_highlight_workbook(
             )
             output_file.parent.mkdir(parents=True, exist_ok=True)
             right_wb.save(output_file)
-            if style_safe_mode:
-                apply_style_safe_highlight_patch(output_file, summary.diff_rows)
+            apply_style_safe_highlight_patch(
+                output_file,
+                summary.diff_rows,
+                source_file=prepared_right,
+                style_safe_mode=style_safe_mode,
+            )
         finally:
             left_wb.close()
             right_wb.close()
@@ -1825,19 +2242,22 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("[ERROR] 하이라이트 출력 파일 확장자는 xlsx 또는 xlsm 이어야 합니다.", file=sys.stderr)
             return 2
 
-    try:
-        report = compare_targets(
-            left_target=left,
-            right_target=right,
-            include_format=args.include_format,
-            max_cell_details=args.max_cell_details,
-            workers=args.workers,
-        )
-    except ValueError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 2
+    report: DiffReport | None = None
+    report_needed = args.output or not highlight_output
+    if report_needed:
+        try:
+            report = compare_targets(
+                left_target=left,
+                right_target=right,
+                include_format=args.include_format,
+                max_cell_details=args.max_cell_details,
+                workers=args.workers,
+            )
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 2
 
-    print_summary(report)
+        print_summary(report)
 
     if highlight_output:
         try:
@@ -1851,6 +2271,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         except (RuntimeError, OSError, BadZipFile) as exc:
             print(f"[ERROR] 하이라이트 파일 생성 실패: {exc}", file=sys.stderr)
             return 2
+
+        if report is None:
+            print("=== Excel Diff Summary ===")
+            print("Mode         : file")
+            print(f"Left target  : {left}")
+            print(f"Right target : {right}")
+            print("Total files  : 1")
+            changed = bool(
+                highlight_summary.modified_cells
+                or highlight_summary.added_cells
+                or highlight_summary.removed_cells
+                or highlight_summary.changed_sheets
+                or highlight_summary.added_sheets
+                or highlight_summary.removed_sheets
+            )
+            print(f"Modified only: {1 if changed else 0}")
+            print("Errors       : 0")
+            print("Scan errors  : 0")
 
         print("=== Highlight Workbook ===")
         print(f"Output file  : {highlight_output.resolve()}")
@@ -1866,6 +2304,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"Changed sheet names: {preview}{suffix}")
 
     if args.output:
+        if report is None:
+            print("[ERROR] 리포트 생성 결과가 없습니다.", file=sys.stderr)
+            return 2
         output_path = Path(args.output).expanduser()
         output_format = args.format
         if output_path.suffix.lower() == ".json":
