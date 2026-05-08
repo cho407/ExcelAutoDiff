@@ -7,15 +7,17 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import sys
 import tempfile
 import unicodedata
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Iterable
+from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
@@ -38,6 +40,8 @@ CHANGED_TAB_COLOR = "FFD966"
 ADDED_TAB_COLOR = "A9D08E"
 DIFF_SUMMARY_TEXT_MAX_LEN = 600
 EXCEL_MAX_ROWS = 1_048_576
+EXCEL_XF_COMBINED_LIMIT = 65_430
+EXCEL_XF_SAFETY_MARGIN = 700
 INVISIBLE_TEXT_CHARS = {
     "\u200b",  # zero width space
     "\u200c",  # zero width non-joiner
@@ -52,6 +56,9 @@ NBSP_TEXT_CHARS = {
     "\u2007",  # figure space
 }
 SHEET_REF_QUOTED_RE = re.compile(r"'((?:''|[^'])+)'!")
+OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 @dataclass(frozen=True)
@@ -778,11 +785,52 @@ def create_unprotected_copy(input_file: Path, output_file: Path) -> None:
                 zout.writestr(info, data)
 
 
-def apply_fill_safe(ws: Worksheet, address: str, fill: PatternFill) -> bool:
+def read_style_xf_counts(xlsx_path: Path) -> tuple[int, int] | None:
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    try:
+        with ZipFile(xlsx_path, "r") as zin:
+            styles_data = zin.read("xl/styles.xml")
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        root = ET.fromstring(styles_data)
+    except Exception:  # noqa: BLE001
+        return None
+
+    cell_xfs = root.find("x:cellXfs", ns)
+    cell_style_xfs = root.find("x:cellStyleXfs", ns)
+    cell_xf_count = len(cell_xfs.findall("x:xf", ns)) if cell_xfs is not None else 0
+    cell_style_xf_count = len(cell_style_xfs.findall("x:xf", ns)) if cell_style_xfs is not None else 0
+    return cell_xf_count, cell_style_xf_count
+
+
+def should_use_style_safe_mode(xlsx_path: Path) -> bool:
+    counts = read_style_xf_counts(xlsx_path)
+    if counts is None:
+        return False
+    cell_xf_count, cell_style_xf_count = counts
+    combined = cell_xf_count + cell_style_xf_count
+    remaining = EXCEL_XF_COMBINED_LIMIT - combined
+    return remaining <= EXCEL_XF_SAFETY_MARGIN
+
+
+def apply_fill_safe(
+    ws: Worksheet,
+    address: str,
+    fill: PatternFill,
+    force_black_font: bool = True,
+    apply_cell_fill: bool = True,
+) -> bool:
     target = ws[address]
     if isinstance(target, MergedCell):
         return False
+    if not apply_cell_fill:
+        return True
+
     target.fill = fill
+    if not force_black_font:
+        return True
     current_font = target.font
     if current_font is None:
         target.font = Font(color=BLACK_FONT_COLOR)
@@ -791,6 +839,18 @@ def apply_fill_safe(ws: Worksheet, address: str, fill: PatternFill) -> bool:
         cloned_font.color = BLACK_FONT_COLOR
         target.font = cloned_font
     return True
+
+
+def clear_workbook_visual_overlays(workbook: Any) -> None:
+    for ws in workbook.worksheets:
+        ws.sheet_properties.tabColor = None
+        conditional_formatting = getattr(ws, "conditional_formatting", None)
+        if conditional_formatting is None:
+            continue
+
+        cf_rules = getattr(conditional_formatting, "_cf_rules", None)
+        if cf_rules is not None:
+            cf_rules.clear()
 
 
 def normalize_cell_visual_to_white_black(ws: Worksheet) -> None:
@@ -973,6 +1033,238 @@ def enforce_single_selected_sheet(workbook: Any, selected_sheet_name: str) -> No
                 continue
 
 
+def ooxml_tag(name: str) -> str:
+    return f"{{{OOXML_MAIN_NS}}}{name}"
+
+
+def relationship_tag(name: str) -> str:
+    return f"{{{PACKAGE_REL_NS}}}{name}"
+
+
+def workbook_sheet_path(target: str) -> str:
+    if target.startswith("/"):
+        return posixpath.normpath(target.lstrip("/"))
+    return posixpath.normpath(posixpath.join("xl", target))
+
+
+def build_sheet_file_map(archive: ZipFile) -> dict[str, str]:
+    workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+
+    rel_targets = {
+        rel.get("Id"): workbook_sheet_path(rel.get("Target", ""))
+        for rel in rels_root.findall(relationship_tag("Relationship"))
+    }
+
+    sheet_map: dict[str, str] = {}
+    for sheet in workbook_root.findall(f".//{ooxml_tag('sheet')}"):
+        sheet_name = sheet.get("name")
+        rel_id = sheet.get(f"{{{OOXML_REL_NS}}}id")
+        target = rel_targets.get(rel_id)
+        if sheet_name and target:
+            sheet_map[sheet_name] = target
+    return sheet_map
+
+
+def changed_cells_by_sheet(
+    diff_rows: list[tuple[str, str, str, str, str]],
+) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    for change_type, sheet_name, cell_addr, _before, _after in diff_rows:
+        result.setdefault(sheet_name, {})[cell_addr.upper()] = change_type
+    return result
+
+
+def set_fill_to_white(fill_node: ET.Element) -> None:
+    fill_node.clear()
+    pattern = ET.SubElement(fill_node, ooxml_tag("patternFill"), {"patternType": "solid"})
+    ET.SubElement(pattern, ooxml_tag("fgColor"), {"rgb": "FFFFFFFF"})
+    ET.SubElement(pattern, ooxml_tag("bgColor"), {"indexed": "64"})
+
+
+def append_solid_fill(fills_node: ET.Element, rgb: str) -> int:
+    fill_id = len(fills_node.findall(ooxml_tag("fill")))
+    fill = ET.SubElement(fills_node, ooxml_tag("fill"))
+    pattern = ET.SubElement(fill, ooxml_tag("patternFill"), {"patternType": "solid"})
+    ET.SubElement(pattern, ooxml_tag("fgColor"), {"rgb": rgb})
+    ET.SubElement(pattern, ooxml_tag("bgColor"), {"indexed": "64"})
+    fills_node.set("count", str(fill_id + 1))
+    return fill_id
+
+
+def force_font_color_black(fonts_node: ET.Element | None) -> None:
+    if fonts_node is None:
+        return
+
+    for font in fonts_node.findall(ooxml_tag("font")):
+        color = font.find(ooxml_tag("color"))
+        if color is not None:
+            color.attrib.clear()
+            color.set("rgb", "FF000000")
+
+
+def prepare_styles_for_safe_highlights(styles_data: bytes) -> tuple[ET.Element, Any] | None:
+    ET.register_namespace("", OOXML_MAIN_NS)
+    ET.register_namespace("r", OOXML_REL_NS)
+
+    root = ET.fromstring(styles_data)
+    fills = root.find(ooxml_tag("fills"))
+    cell_xfs = root.find(ooxml_tag("cellXfs"))
+    if fills is None or cell_xfs is None:
+        return None
+
+    fill_nodes = fills.findall(ooxml_tag("fill"))
+    for fill_index, fill in enumerate(fill_nodes):
+        if fill_index >= 2:
+            set_fill_to_white(fill)
+
+    force_font_color_black(root.find(ooxml_tag("fonts")))
+
+    highlight_fill_ids = {
+        "modified": append_solid_fill(fills, "FFFFF2CC"),
+        "added": append_solid_fill(fills, "FFC6EFCE"),
+        "removed": append_solid_fill(fills, "FFF8CBAD"),
+    }
+
+    xf_nodes = cell_xfs.findall(ooxml_tag("xf"))
+    style_cache: dict[tuple[int, str], int] = {}
+
+    def highlighted_style(base_style_id: int, change_type: str) -> int:
+        key = (base_style_id, change_type)
+        if key in style_cache:
+            return style_cache[key]
+
+        base = xf_nodes[base_style_id] if 0 <= base_style_id < len(xf_nodes) else xf_nodes[0]
+        new_xf = deepcopy(base)
+        new_xf.set("fillId", str(highlight_fill_ids.get(change_type, highlight_fill_ids["modified"])))
+        new_xf.set("applyFill", "1")
+        cell_xfs.append(new_xf)
+        xf_nodes.append(new_xf)
+        new_style_id = len(xf_nodes) - 1
+        style_cache[key] = new_style_id
+        cell_xfs.set("count", str(len(xf_nodes)))
+        return new_style_id
+
+    return root, highlighted_style
+
+
+def patch_worksheet_highlight_styles(
+    sheet_data: bytes,
+    cell_changes: dict[str, str],
+    style_factory: Any,
+) -> bytes:
+    if not cell_changes:
+        return sheet_data
+
+    root = ET.fromstring(sheet_data)
+    found_refs: set[str] = set()
+    for cell in root.findall(f".//{ooxml_tag('c')}"):
+        ref = (cell.get("r") or "").upper()
+        change_type = cell_changes.get(ref)
+        if not change_type:
+            continue
+
+        found_refs.add(ref)
+        try:
+            base_style_id = int(cell.get("s", "0"))
+        except ValueError:
+            base_style_id = 0
+        cell.set("s", str(style_factory(base_style_id, change_type)))
+
+    missing_refs = sorted(set(cell_changes) - found_refs, key=cell_sort_key)
+    if missing_refs:
+        sheet_data_node = root.find(ooxml_tag("sheetData"))
+        if sheet_data_node is not None:
+            rows_by_number = {
+                int(row.get("r", "0")): row
+                for row in sheet_data_node.findall(ooxml_tag("row"))
+                if row.get("r", "0").isdigit()
+            }
+
+            for ref in missing_refs:
+                row_idx, col_idx = cell_sort_key(ref)
+                if row_idx == sys.maxsize:
+                    continue
+
+                row = rows_by_number.get(row_idx)
+                if row is None:
+                    row = ET.Element(ooxml_tag("row"), {"r": str(row_idx)})
+                    inserted = False
+                    for index, existing_row in enumerate(list(sheet_data_node)):
+                        existing_idx = int(existing_row.get("r", "0")) if existing_row.get("r", "0").isdigit() else 0
+                        if existing_idx > row_idx:
+                            sheet_data_node.insert(index, row)
+                            inserted = True
+                            break
+                    if not inserted:
+                        sheet_data_node.append(row)
+                    rows_by_number[row_idx] = row
+
+                new_cell = ET.Element(
+                    ooxml_tag("c"),
+                    {
+                        "r": ref,
+                        "s": str(style_factory(0, cell_changes[ref])),
+                    },
+                )
+                inserted = False
+                for index, existing_cell in enumerate(list(row)):
+                    existing_ref = (existing_cell.get("r") or "").upper()
+                    _existing_row, existing_col = cell_sort_key(existing_ref)
+                    if existing_col > col_idx:
+                        row.insert(index, new_cell)
+                        inserted = True
+                        break
+                if not inserted:
+                    row.append(new_cell)
+
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def apply_style_safe_highlight_patch(
+    output_file: Path,
+    diff_rows: list[tuple[str, str, str, str, str]],
+) -> None:
+    changes = changed_cells_by_sheet(diff_rows)
+    if not changes:
+        return
+
+    temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
+    with ZipFile(output_file, "r") as zin:
+        sheet_file_map = build_sheet_file_map(zin)
+        sheet_changes_by_file = {
+            sheet_file_map[sheet_name]: cell_changes
+            for sheet_name, cell_changes in changes.items()
+            if sheet_name in sheet_file_map
+        }
+
+        prepared_styles = prepare_styles_for_safe_highlights(zin.read("xl/styles.xml"))
+        if prepared_styles is None:
+            return
+        styles_root, style_factory = prepared_styles
+
+        patched_sheets: dict[str, bytes] = {}
+        for sheet_file, cell_changes in sheet_changes_by_file.items():
+            patched_sheets[sheet_file] = patch_worksheet_highlight_styles(
+                zin.read(sheet_file),
+                cell_changes,
+                style_factory,
+            )
+
+        patched_styles = ET.tostring(styles_root, encoding="utf-8", xml_declaration=True)
+
+        with ZipFile(temp_file, "w") as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "xl/styles.xml":
+                    data = patched_styles
+                elif info.filename in patched_sheets:
+                    data = patched_sheets[info.filename]
+                zout.writestr(info, data)
+
+    temp_file.replace(output_file)
+
+
 def make_all_visible_and_unprotected(workbook: Any) -> None:
     if getattr(workbook, "security", None):
         workbook.security.lockStructure = False
@@ -1129,8 +1421,12 @@ def generate_highlight_workbook(
             raise RuntimeError(right_error)
 
         try:
+            style_safe_mode = should_use_style_safe_mode(prepared_right)
             make_all_visible_and_unprotected(right_wb)
-            normalize_workbook_visual_to_white_black(right_wb)
+            if not style_safe_mode:
+                normalize_workbook_visual_to_white_black(right_wb)
+            else:
+                clear_workbook_visual_overlays(right_wb)
 
             left_sheets = set(left_wb.sheetnames)
             right_sheets = set(right_wb.sheetnames)
@@ -1145,7 +1441,13 @@ def generate_highlight_workbook(
                 changed_sheet_names.add(sheet_name)
                 right_cells = extract_cells(right_ws, include_format=False)
                 for addr in sorted(right_cells.keys(), key=cell_sort_key):
-                    if apply_fill_safe(right_ws, addr, ADDED_FILL):
+                    if apply_fill_safe(
+                        right_ws,
+                        addr,
+                        ADDED_FILL,
+                        force_black_font=not style_safe_mode,
+                        apply_cell_fill=not style_safe_mode,
+                    ):
                         summary.added_cells += 1
                     add_diff_row(
                         summary=summary,
@@ -1200,7 +1502,13 @@ def generate_highlight_workbook(
                 sheet_has_changes = bool(added_keys or removed_keys or modified_keys)
 
                 for addr in sorted(added_keys, key=cell_sort_key):
-                    if apply_fill_safe(right_ws, addr, ADDED_FILL):
+                    if apply_fill_safe(
+                        right_ws,
+                        addr,
+                        ADDED_FILL,
+                        force_black_font=not style_safe_mode,
+                        apply_cell_fill=not style_safe_mode,
+                    ):
                         summary.added_cells += 1
                     add_diff_row(
                         summary=summary,
@@ -1212,7 +1520,13 @@ def generate_highlight_workbook(
                     )
 
                 for addr in sorted(removed_keys, key=cell_sort_key):
-                    if apply_fill_safe(right_ws, addr, REMOVED_FILL):
+                    if apply_fill_safe(
+                        right_ws,
+                        addr,
+                        REMOVED_FILL,
+                        force_black_font=not style_safe_mode,
+                        apply_cell_fill=not style_safe_mode,
+                    ):
                         summary.removed_cells += 1
                     add_diff_row(
                         summary=summary,
@@ -1224,7 +1538,13 @@ def generate_highlight_workbook(
                     )
 
                 for addr in sorted(modified_keys, key=cell_sort_key):
-                    if apply_fill_safe(right_ws, addr, MODIFIED_FILL):
+                    if apply_fill_safe(
+                        right_ws,
+                        addr,
+                        MODIFIED_FILL,
+                        force_black_font=not style_safe_mode,
+                        apply_cell_fill=not style_safe_mode,
+                    ):
                         summary.modified_cells += 1
                     add_diff_row(
                         summary=summary,
@@ -1249,6 +1569,8 @@ def generate_highlight_workbook(
             )
             output_file.parent.mkdir(parents=True, exist_ok=True)
             right_wb.save(output_file)
+            if style_safe_mode:
+                apply_style_safe_highlight_patch(output_file, summary.diff_rows)
         finally:
             left_wb.close()
             right_wb.close()
